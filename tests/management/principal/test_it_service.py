@@ -15,23 +15,388 @@
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 #
 """Test the principal model."""
+import requests
 import uuid
 
 from django.conf import settings
 
-from management.principal.it_service import ITService
-from rest_framework import serializers
+from management.principal.it_service import ITService, UnexpectedStatusCodeFromITError
+from rest_framework import serializers, status
 from tests.identity_request import IdentityRequest
 from unittest import mock
 
 from api.models import User
+
+# IT path to fetch the service accounts.
+IT_PATH_GET_SERVICE_ACCOUNTS = "/service_accounts/v1"
 
 
 class ITServiceTests(IdentityRequest):
     """Test the IT service class"""
 
     def setUp(self):
+        # Set up some settings so that the class builds IT's URL.
+        settings.IT_SERVICE_HOST = "localhost"
+        settings.IT_SERVICE_BASE_PATH = "/"
+        settings.IT_SERVICE_PORT = "999"
+        settings.IT_SERVICE_PROTOCOL_SCHEME = "http"
+        settings.IT_SERVICE_TIMEOUT_SECONDS = 10
+
         self.it_service = ITService()
+
+    def _create_mock_it_service_accounts(self, number: int) -> list[dict[str, str]]:
+        """Create mock service accounts as returned by IT."""
+        service_accounts: list[dict] = []
+        for i in range(number):
+            client_id = str(uuid.uuid4())
+
+            service_accounts.append(
+                {
+                    "clientId": client_id,
+                    "name": f"name-{client_id}",
+                    "description": f"description-{client_id}",
+                    "createdBy": f"createdBy-{client_id}",
+                    "createdAt": f"createdAt-{client_id}",
+                }
+            )
+
+        return service_accounts
+
+    def _assert_IT_to_RBAC_model_transformations(
+        self, it_service_accounts: list[dict[str, str]], rbac_service_accounts: list[dict[str, str]]
+    ) -> None:
+        """Assert that the service accounts coming from IT were correctly transformed into our model"""
+        # Rearrange RBAC's service accounts by client ID for an easier search later on.
+        rbac_service_accounts_by_cid: dict[str, dict[str, str]] = {}
+        for rbac_sa in rbac_service_accounts:
+            rbac_sa_cid = rbac_sa.get("clientID")
+            if not rbac_sa_cid:
+                self.fail(f'the transformed service account does not have the "clientID" property: {rbac_sa}')
+
+            rbac_service_accounts_by_cid[rbac_sa_cid] = rbac_sa
+
+        # Make all the assertions for the contents.
+        for it_sa in it_service_accounts:
+            client_id = it_sa.get("clientId")
+            if not client_id:
+                self.fail(f'the IT service account dictionary does not have the "clientId" property: {it_sa}')
+
+            rbac_sa = rbac_service_accounts_by_cid.get(client_id)
+            if not rbac_sa:
+                self.fail(
+                    f"the transformed RBAC service accounts do not contain a service account with client ID"
+                    f' "{client_id}". RBAC service accounts: {rbac_service_accounts_by_cid}'
+                )
+
+            # Assert that the client IDs are the same.
+            rbac_sa_client_id = rbac_sa.get("clientID")
+            if not rbac_sa_client_id:
+                self.fail(f'the transformed RBAC service account does not contain the "clientID" property: {rbac_sa}')
+
+            self.assertEqual(rbac_sa_client_id, client_id, "the client IDs for the RBAC and IT models do not match")
+
+            # Assert that the names are the same.
+            rbac_sa_name = rbac_sa.get("name")
+            if not rbac_sa_name:
+                self.fail(f'the transformed RBAC service account does not contain the "name" property: {rbac_sa}')
+
+            it_sa_name = it_sa.get("name")
+            if not it_sa_name:
+                self.fail(f'the IT service account does not contain the "name" property: {it_sa}')
+
+            self.assertEqual(rbac_sa_name, it_sa_name, "the names for the RBAC and IT models do not match")
+
+            # Assert that the descriptions are the same.
+            rbac_sa_description = rbac_sa.get("description")
+            if not rbac_sa_description:
+                self.fail(
+                    f'the transformed RBAC service account does not contain the "description" property: {rbac_sa}'
+                )
+
+            it_sa_description = it_sa.get("description")
+            if not it_sa_description:
+                self.fail(f'the IT service account does not contain the "description" property: {it_sa}')
+
+            self.assertEqual(
+                rbac_sa_description, it_sa_description, "the descriptions for the RBAC and IT models do not match"
+            )
+
+            # Assert that the created by fields are the same.
+            rbac_sa_created_by = rbac_sa.get("owner")
+            if not rbac_sa_created_by:
+                self.fail(f'the transformed RBAC service account does not contain the "owner" property: {rbac_sa}')
+
+            it_sa_created_by = it_sa.get("createdBy")
+            if not it_sa_created_by:
+                self.fail(f'the IT service account does not contain the "createdBy" property: {it_sa}')
+
+            self.assertEqual(
+                rbac_sa_created_by,
+                it_sa_created_by,
+                "the owner and created by fields for the RBAC and IT models do not match",
+            )
+
+            # Assert that the created at fields are the same.
+            rbac_sa_created_at = rbac_sa.get("time_created")
+            if not rbac_sa_created_at:
+                self.fail(
+                    f'the transformed RBAC service account does not contain the "time_created" property: {rbac_sa}'
+                )
+
+            it_sa_created_at = it_sa.get("createdAt")
+            if not it_sa_created_at:
+                self.fail(f'the IT service account does not contain the "createdBy" property: {it_sa}')
+
+            self.assertEqual(
+                rbac_sa_created_at,
+                it_sa_created_at,
+                "the time created and created at fields for the RBAC and IT models do not match",
+            )
+
+    @mock.patch("management.principal.it_service.requests.get")
+    def test_request_service_accounts_single_page(self, get: mock.Mock):
+        """Test that the function under test can handle fetching a single page of service accounts from IT"""
+        # Create the mocked response from IT.
+        mocked_service_accounts = self._create_mock_it_service_accounts(5)
+
+        get.__name__ = "get"
+        get.return_value = mock.Mock(
+            json=lambda: mocked_service_accounts,
+            status_code=status.HTTP_200_OK,
+        )
+
+        bearer_token_mock = "bearer-token-mock"
+        client_ids = [str(uuid.uuid4()), str(uuid.uuid4()), str(uuid.uuid4())]
+
+        # Call the function under test.
+        result: list[dict] = self.it_service.request_service_accounts(
+            bearer_token=bearer_token_mock, client_ids=client_ids
+        )
+
+        # Build IT's URL for the function call's assertion.
+        it_url = (
+            f"{settings.IT_SERVICE_PROTOCOL_SCHEME}://{settings.IT_SERVICE_HOST}:{settings.IT_SERVICE_PORT}"
+            f"{settings.IT_SERVICE_BASE_PATH}{IT_PATH_GET_SERVICE_ACCOUNTS}"
+        )
+
+        # Build the expected parameters to be seen in the "get" function's assertion call.
+        parameters = {"first": 0, "max": 100, "clientId": client_ids}
+
+        # Assert that the "get" function was called with the expected arguments.
+        get.assert_called_with(
+            url=it_url,
+            headers={"Authorization": f"Bearer {bearer_token_mock}"},
+            params=parameters,
+            timeout=settings.IT_SERVICE_TIMEOUT_SECONDS,
+        )
+
+        # Assert that the payload is correct.
+        self._assert_IT_to_RBAC_model_transformations(
+            it_service_accounts=mocked_service_accounts, rbac_service_accounts=result
+        )
+
+    @mock.patch("management.principal.it_service.requests.get")
+    def test_request_service_accounts_multiple_pages(self, get: mock.Mock):
+        """Test that the function under test can handle fetching multiple pages from IT"""
+        # Create the mocked response from IT.
+        mocked_service_accounts = self._create_mock_it_service_accounts(300)
+
+        # Make sure the "get" function returns multiple pages of service accounts.
+        first_hundred_sas = mocked_service_accounts[0:100]
+        second_hundred_sas = mocked_service_accounts[100:200]
+        third_hundred_sas = mocked_service_accounts[200:300]
+
+        get.__name__ = "get"
+        get.side_effect = [
+            mock.Mock(
+                json=lambda: first_hundred_sas,
+                status_code=status.HTTP_200_OK,
+            ),
+            mock.Mock(
+                json=lambda: second_hundred_sas,
+                status_code=status.HTTP_200_OK,
+            ),
+            mock.Mock(
+                json=lambda: third_hundred_sas,
+                status_code=status.HTTP_200_OK,
+            ),
+            mock.Mock(
+                json=lambda: [],
+                status_code=status.HTTP_200_OK,
+            ),
+        ]
+
+        bearer_token_mock = "bearer-token-mock"
+        # For multiple pages giving just three client IDs does not make sense, but we are going to give them anyway to
+        # check that the parameter is included.
+        client_ids = [str(uuid.uuid4()), str(uuid.uuid4()), str(uuid.uuid4())]
+
+        # Call the function under test.
+        result: list[dict] = self.it_service.request_service_accounts(
+            bearer_token=bearer_token_mock, client_ids=client_ids
+        )
+
+        # Build IT's URL for the function call's assertion.
+        it_url = (
+            f"{settings.IT_SERVICE_PROTOCOL_SCHEME}://{settings.IT_SERVICE_HOST}:{settings.IT_SERVICE_PORT}"
+            f"{settings.IT_SERVICE_BASE_PATH}{IT_PATH_GET_SERVICE_ACCOUNTS}"
+        )
+
+        # Assert that the "get" function is called with the expected arguments for the multiple pages.
+        parameters_first_call = {"first": 0, "max": 100, "clientId": client_ids}
+        parameters_second_call = {"first": 100, "max": 100, "clientId": client_ids}
+        parameters_third_call = {"first": 200, "max": 100, "clientId": client_ids}
+        parameters_fourth_call = {"first": 300, "max": 100, "clientId": client_ids}
+
+        get.assert_has_calls(
+            [
+                mock.call(
+                    url=it_url,
+                    headers={"Authorization": f"Bearer {bearer_token_mock}"},
+                    params=parameters_first_call,
+                    timeout=settings.IT_SERVICE_TIMEOUT_SECONDS,
+                ),
+                mock.call(
+                    url=it_url,
+                    headers={"Authorization": f"Bearer {bearer_token_mock}"},
+                    params=parameters_second_call,
+                    timeout=settings.IT_SERVICE_TIMEOUT_SECONDS,
+                ),
+                mock.call(
+                    url=it_url,
+                    headers={"Authorization": f"Bearer {bearer_token_mock}"},
+                    params=parameters_third_call,
+                    timeout=settings.IT_SERVICE_TIMEOUT_SECONDS,
+                ),
+                mock.call(
+                    url=it_url,
+                    headers={"Authorization": f"Bearer {bearer_token_mock}"},
+                    params=parameters_fourth_call,
+                    timeout=settings.IT_SERVICE_TIMEOUT_SECONDS,
+                ),
+            ]
+        )
+
+        # Assert that the payload is correct.
+        self._assert_IT_to_RBAC_model_transformations(
+            it_service_accounts=mocked_service_accounts, rbac_service_accounts=result
+        )
+
+    @mock.patch("management.principal.it_service.requests.get")
+    def test_request_service_accounts_unexpected_status_code(self, get: mock.Mock):
+        """Test that the function under test raises an exception when an unexpected status code is received from IT"""
+        get.__name__ = "get"
+        get.return_value = mock.Mock(
+            json=[],
+            status_code=status.HTTP_401_UNAUTHORIZED,
+        )
+
+        bearer_token_mock = "bearer-token-mock"
+        client_ids = [str(uuid.uuid4()), str(uuid.uuid4()), str(uuid.uuid4())]
+
+        # Call the function under test.
+        try:
+            self.it_service.request_service_accounts(bearer_token=bearer_token_mock, client_ids=client_ids)
+            self.fail("the function under test should have raised an exception on an unexpected status code")
+        except Exception as e:
+            self.assertIsInstance(
+                e,
+                UnexpectedStatusCodeFromITError,
+                "unexpected exception raised when the status code received from IT is unexpected",
+            )
+
+        # Build IT's URL for the function call's assertion.
+        it_url = (
+            f"{settings.IT_SERVICE_PROTOCOL_SCHEME}://{settings.IT_SERVICE_HOST}:{settings.IT_SERVICE_PORT}"
+            f"{settings.IT_SERVICE_BASE_PATH}{IT_PATH_GET_SERVICE_ACCOUNTS}"
+        )
+
+        # Build the expected parameters to be seen in the "get" function's assertion call.
+        parameters = {"first": 0, "max": 100, "clientId": client_ids}
+
+        # Assert that the "get" function was called with the expected arguments.
+        get.assert_called_with(
+            url=it_url,
+            headers={"Authorization": f"Bearer {bearer_token_mock}"},
+            params=parameters,
+            timeout=settings.IT_SERVICE_TIMEOUT_SECONDS,
+        )
+
+    @mock.patch("management.principal.it_service.requests.get")
+    def test_request_service_accounts_connection_error(self, get: mock.Mock):
+        """Test that the function under test raises an exception a connection error happens when connecting to IT"""
+        get.__name__ = "get"
+        get.side_effect = requests.exceptions.ConnectionError
+
+        bearer_token_mock = "bearer-token-mock"
+        client_ids = [str(uuid.uuid4()), str(uuid.uuid4()), str(uuid.uuid4())]
+
+        # Call the function under test.
+        try:
+            self.it_service.request_service_accounts(bearer_token=bearer_token_mock, client_ids=client_ids)
+            self.fail(
+                "the function under test should have raised an exception when hitting a connection error with IT"
+            )
+        except Exception as e:
+            self.assertIsInstance(
+                e,
+                requests.exceptions.ConnectionError,
+                "unexpected exception raised when there is a connection error to IT",
+            )
+
+        # Build IT's URL for the function call's assertion.
+        it_url = (
+            f"{settings.IT_SERVICE_PROTOCOL_SCHEME}://{settings.IT_SERVICE_HOST}:{settings.IT_SERVICE_PORT}"
+            f"{settings.IT_SERVICE_BASE_PATH}{IT_PATH_GET_SERVICE_ACCOUNTS}"
+        )
+
+        # Build the expected parameters to be seen in the "get" function's assertion call.
+        parameters = {"first": 0, "max": 100, "clientId": client_ids}
+
+        # Assert that the "get" function was called with the expected arguments.
+        get.assert_called_with(
+            url=it_url,
+            headers={"Authorization": f"Bearer {bearer_token_mock}"},
+            params=parameters,
+            timeout=settings.IT_SERVICE_TIMEOUT_SECONDS,
+        )
+
+    @mock.patch("management.principal.it_service.requests.get")
+    def test_request_service_accounts_timeout(self, get: mock.Mock):
+        """Test that the function under test raises an exception a connection error happens when connecting to IT"""
+        get.__name__ = "get"
+        get.side_effect = requests.exceptions.Timeout
+
+        bearer_token_mock = "bearer-token-mock"
+        client_ids = [str(uuid.uuid4()), str(uuid.uuid4()), str(uuid.uuid4())]
+
+        # Call the function under test.
+        try:
+            self.it_service.request_service_accounts(bearer_token=bearer_token_mock, client_ids=client_ids)
+            self.fail("the function under test should have raised an exception when having a timeout with IT")
+        except Exception as e:
+            self.assertIsInstance(
+                e,
+                requests.exceptions.Timeout,
+                "unexpected exception raised when there is a timeout with IT",
+            )
+
+        # Build IT's URL for the function call's assertion.
+        it_url = (
+            f"{settings.IT_SERVICE_PROTOCOL_SCHEME}://{settings.IT_SERVICE_HOST}:{settings.IT_SERVICE_PORT}"
+            f"{settings.IT_SERVICE_BASE_PATH}{IT_PATH_GET_SERVICE_ACCOUNTS}"
+        )
+
+        # Build the expected parameters to be seen in the "get" function's assertion call.
+        parameters = {"first": 0, "max": 100, "clientId": client_ids}
+
+        # Assert that the "get" function was called with the expected arguments.
+        get.assert_called_with(
+            url=it_url,
+            headers={"Authorization": f"Bearer {bearer_token_mock}"},
+            params=parameters,
+            timeout=settings.IT_SERVICE_TIMEOUT_SECONDS,
+        )
 
     @mock.patch("management.principal.it_service.ITService._is_service_account_valid")
     def test_is_service_account_valid_by_username_client_id(self, _is_service_account_valid: mock.Mock):

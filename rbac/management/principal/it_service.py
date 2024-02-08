@@ -87,17 +87,19 @@ class ITService:
 
         # Attempt fetching all the service accounts for the tenant.
         try:
+            # Define some sane initial values.
             offset = 0
             limit = 100
 
-            # If the offset is zero, that means that we need to call the service at least once to get the first
-            # service accounts. If it equals the limit, that means that there are more pages to fetch.
-            parameters = {"first": offset, "max": limit}
-            # If we were given client IDs to filter the collection with, do it!
-            if client_ids:
-                parameters["clientId"] = client_ids
+            continue_fetching: bool = True
+            while continue_fetching:
+                # Recreate the parameters dictionary every time since otherwise the "assert_has_calls" statement of the
+                # tests only sees the last value for the offset when attempting to fetch multiple pages.
+                parameters = {"first": offset, "max": limit}
+                if client_ids:
+                    parameters["clientId"] = client_ids
 
-            while offset == 0 or offset == limit:
+                # Call IT.
                 response = requests.get(
                     url=self.it_url,
                     headers={"Authorization": f"Bearer {bearer_token}"},
@@ -122,14 +124,15 @@ class ITService:
                 # Extract the body contents.
                 body_contents = response.json()
 
-                # Recalculate the offset to decide whether to get more service accounts or not. If the offset is zero,
-                # it means that there were no service accounts in IT for the tenant.
-                offset = offset + len(body_contents)
-                if offset == 0:
-                    break
-
                 # Merge the previously received service accounts with the new ones.
                 received_service_accounts = received_service_accounts + body_contents
+
+                # Reassess if we need to keep fetching pages from IT. They don't return page metadata, so we need to
+                # keep looping until the incoming body is an empty array.
+                continue_fetching = limit == len(body_contents)
+                if continue_fetching:
+                    offset = offset + len(body_contents)
+
         except requests.exceptions.ConnectionError as exception:
             LOGGER.error(
                 "Unable to connect to IT to fetch the service accounts. Attempted URL %s with error: %s",
@@ -140,7 +143,7 @@ class ITService:
             # Increment the error count.
             it_request_error.labels(error="connection-error").inc()
 
-            # Raise the exception again to return a proper response to the client
+            # Raise the exception again to return a proper response to the client.
             raise exception
         except requests.exceptions.Timeout as exception:
             LOGGER.error(
@@ -151,6 +154,9 @@ class ITService:
 
             # Increment the error count.
             it_request_error.labels(error="timeout").inc()
+
+            # Raise the exception again to return a proper response to the client.
+            raise exception
 
         # Transform the incoming payload into our model's service accounts.
         service_accounts: list[dict] = []
