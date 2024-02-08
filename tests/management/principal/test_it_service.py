@@ -20,6 +20,7 @@ import uuid
 from django.conf import settings
 
 from management.principal.it_service import ITService
+from rest_framework import serializers
 from tests.identity_request import IdentityRequest
 from unittest import mock
 
@@ -62,7 +63,7 @@ class ITServiceTests(IdentityRequest):
 
             self.assertEqual(
                 True,
-                self.it_service._is_service_account_valid(client_id="mocked-cid"),
+                self.it_service._is_service_account_valid(user=User(), client_id="mocked-cid"),
                 "when IT calls are bypassed, a service account should always be validated as if it existed",
             )
         finally:
@@ -146,4 +147,35 @@ class ITServiceTests(IdentityRequest):
                 ITService.is_username_service_account(username),
                 False,
                 f"the given username '{username}' should have not been identified as a service account username",
+            )
+
+    def test_extract_client_id_service_account_username(self) -> None:
+        """Test that the client ID is correctly extracted from the service account's username"""
+        client_id = uuid.uuid4()
+
+        # Call the function under test with just the client ID. It should return it as is.
+        self.assertEqual(
+            client_id,
+            ITService.extract_client_id_service_account_username(username=str(client_id)),
+            "the client ID should be returned when it is passed to the function under test",
+        )
+
+        # Call the function under test with the whole prefix, and check that the client ID is correctly identified.
+        self.assertEqual(
+            client_id,
+            ITService.extract_client_id_service_account_username(username=f"service-account-{client_id}"),
+            "the client ID was not correctly extracted from a full username",
+        )
+
+        # Call the function under test with an invalid username which contains a bad formed UUID.
+        try:
+            ITService.extract_client_id_service_account_username(username="abcde")
+            self.fail(
+                "when providing an invalid UUID as the client ID to be extracted, the function under test should raise an error"
+            )
+        except serializers.ValidationError as ve:
+            self.assertEqual(
+                "unable to extract the client ID from the service account's username because the provided UUID is invalid",
+                str(ve.detail.get("detail")),
+                "unexpected error message when providing an invalid UUID as the client ID",
             )
