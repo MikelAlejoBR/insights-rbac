@@ -208,7 +208,7 @@ class ITService:
                 )
                 return False
 
-    def get_service_accounts(self, user: User, options: dict = {}) -> (list[dict], int):
+    def get_service_accounts(self, user: User, options: dict[str, any] = {}) -> (list[dict], int):
         """Request and returns the service accounts for the given tenant."""
         # We might want to bypass calls to the IT service on ephemeral or test environments.
         it_service_accounts: list[dict] = []
@@ -279,7 +279,7 @@ class ITService:
             )
 
         # Put the service accounts in a dict by for a quicker search.
-        sap_dict: dict[str, dict] = {}
+        sap_dict: dict[str, Principal] = {}
         for sap in service_account_principals:
             sap_dict[sap.service_account_id] = sap
 
@@ -291,10 +291,10 @@ class ITService:
 
         return service_accounts, count
 
-    def get_service_accounts_group(self, group: Group, user: User, options: dict = {}) -> list[dict]:
+    def get_service_accounts_group(self, group: Group, user: User, options: dict[str, any] = {}) -> list[dict]:
         """Get the service accounts for the given group."""
         # We might want to bypass calls to the IT service on ephemeral or test environments.
-        it_service_accounts: list[dict] = []
+        it_service_accounts: list[dict[str, any]] = []
         if not settings.IT_BYPASS_IT_CALLS:
             it_service_accounts = self.request_service_accounts(bearer_token=user.bearer_token)
 
@@ -327,7 +327,7 @@ class ITService:
             )
 
         # Put the service accounts in a dict by for a quicker search.
-        sap_dict: dict[str, dict] = {}
+        sap_dict: dict[str, Principal] = {}
         for sap in group_service_account_principals:
             sap_dict[sap.service_account_id] = sap
 
@@ -391,9 +391,9 @@ class ITService:
                 }
             )
 
-    def _transform_incoming_payload(self, service_account_from_it_service: dict) -> dict:
+    def _transform_incoming_payload(self, service_account_from_it_service: dict) -> dict[str, any]:
         """Transform the incoming service account from IT into a dict which fits our response structure."""
-        service_account: dict = {}
+        service_account: dict[str, any] = {}
 
         client_id = service_account_from_it_service.get("clientId")
         name = service_account_from_it_service.get("name")
@@ -422,10 +422,13 @@ class ITService:
         return service_account
 
     def _merge_principals_it_service_accounts(
-        self, service_account_principals: dict[str, dict], it_service_accounts: list[dict], options: dict
+        self, service_account_principals: dict[str, Principal], it_service_accounts: list[dict], options: dict
     ) -> list[dict]:
-        """Merge the database principals with the service account principals and return the response payload."""
-        service_accounts: [dict] = []
+        """Merge the database principals with the service account principals and return the response payload.
+
+        We only return the service accounts which we have references for in our database.
+        """
+        service_accounts: list[dict] = []
 
         # If the "username_only" parameter was set, we should only return that for the user.
         username_only = options.get("username_only")
@@ -442,7 +445,7 @@ class ITService:
 
                     service_accounts.append(it_service_account)
             # If we cannot find a requested service account to IT in the database, we simply
-            # skip them.
+            # skip it.
             except KeyError:
                 continue
 
